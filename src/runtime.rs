@@ -3,6 +3,7 @@
 //! For more information on foreign functions, see Apple's documentation:
 //! <https://developer.apple.com/library/mac/documentation/Cocoa/Reference/ObjCRuntimeRef/index.html>
 
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -65,6 +66,12 @@ pub struct Protocol {
     _priv: PrivateMarker
 }
 
+/// A type that represents an Objective-C property.
+#[repr(C)]
+pub struct Property {
+    _priv: PrivateMarker
+}
+
 /// A type that represents an instance of a class.
 #[repr(C)]
 pub struct Object {
@@ -91,6 +98,7 @@ extern {
     pub fn class_addProtocol(cls: *mut Class, proto: *const Protocol) -> BOOL;
     pub fn class_conformsToProtocol(cls: *const Class, proto: *const Protocol) -> BOOL;
     pub fn class_copyProtocolList(cls: *const Class, outCount: *mut c_uint) -> *mut *const Protocol;
+    pub fn class_copyPropertyList(cls: *const Class, outCount: *mut c_uint) -> *mut *const Property;
 
     pub fn objc_allocateClassPair(superclass: *const Class, name: *const c_char, extraBytes: usize) -> *mut Class;
     pub fn objc_disposeClassPair(cls: *mut Class);
@@ -118,6 +126,9 @@ extern {
     pub fn protocol_isEqual(proto: *const Protocol, other: *const Protocol) -> BOOL;
     pub fn protocol_copyProtocolList(proto: *const Protocol, outCount: *mut c_uint) -> *mut *const Protocol;
     pub fn protocol_conformsToProtocol(proto: *const Protocol, other: *const Protocol) -> BOOL;
+
+    pub fn property_getName(prop: *const Property) -> *const c_char;
+    pub fn property_getAttributes(prop: *const Property) -> *const c_char;
 
     pub fn ivar_getName(ivar: *const Ivar) -> *const c_char;
     pub fn ivar_getOffset(ivar: *const Ivar) -> isize;
@@ -372,6 +383,15 @@ impl Class {
         }
     }
 
+    /// Get a list of the properties on the class.
+    pub fn properties(&self) -> Malloc<[&Property]> {
+        unsafe {
+            let mut count: c_uint = 0;
+            let props = class_copyPropertyList(self, &mut count);
+            Malloc::from_array(props as *mut _, count as usize)
+        }
+    }
+
     /// Describes the instance variables declared by self.
     pub fn instance_variables(&self) -> Malloc<[&Ivar]> {
         unsafe {
@@ -455,6 +475,93 @@ impl fmt::Debug for Protocol {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PropertyAttribute<'a> {
+    /// The property is read-only (readonly).
+    ReadOnly,
+    /// The property is a copy of the value last assigned (copy).
+    Copy,
+    /// The property is retained (retain).
+    Retain,
+    /// The property is non-atomic (nonatomic).
+    Nonatomic,
+    /// The property defines a custom getter selector name.
+    Getter(Cow<'a, str>),
+    /// The property defines a custom setter selector name.
+    Setter(Cow<'a, str>),
+    /// The property is dynamic (@dynamic).
+    Dynamic,
+    /// The property is a weak reference (__weak).
+    Weak,
+    /// The property is eligible for garbage collection.
+    GarbageCollected,
+    /// The property has a custom type encoding.
+    TypeEncoding(Cow<'a, str>),
+    /// The property attribute is unknown.
+    Unknown(Cow<'a, str>)
+}
+
+impl PropertyAttribute<'_> {
+    fn value(&self) -> Option<String> {
+        Some(match self {
+            PropertyAttribute::Getter(v) => v.to_string(),
+            PropertyAttribute::Setter(v) => v.to_string(),
+            PropertyAttribute::TypeEncoding(v) => v.to_string(),
+            PropertyAttribute::Unknown(v) => v.to_string(),
+            _ => return None
+        })
+    }
+}
+
+impl<'a> From<&'a str> for PropertyAttribute<'a> {
+    fn from(attr: &'a str) -> PropertyAttribute<'a> {
+        match attr {
+            "R" => PropertyAttribute::ReadOnly,
+            "C" => PropertyAttribute::Copy,
+            "&" => PropertyAttribute::Retain,
+            "N" => PropertyAttribute::Nonatomic,
+            "D" => PropertyAttribute::Dynamic,
+            "W" => PropertyAttribute::Weak,
+            "P" => PropertyAttribute::GarbageCollected,
+            _ => {
+                if attr.starts_with("G") {
+                    PropertyAttribute::Getter(Cow::Borrowed(&attr[1..]))
+                } else if attr.starts_with("S") {
+                    PropertyAttribute::Setter(Cow::Borrowed(&attr[1..]))
+                } else if attr.starts_with("T") {
+                    PropertyAttribute::TypeEncoding(Cow::Borrowed(&attr[1..]))
+                } else {
+                    PropertyAttribute::Unknown(Cow::Borrowed(attr))
+                }
+            }
+        }
+    }
+}
+
+impl Property {
+    /// Returns the attributes of the property
+    pub fn attributes(&self) -> impl Iterator<Item = PropertyAttribute<'_>> {
+        let attrs = unsafe {
+            CStr::from_ptr(property_getAttributes(self))
+        };
+        attrs.to_str().unwrap().split(',').map(|attr| attr.into())
+    }
+
+    /// Returns the name of self.
+    pub fn name(&self) -> &str {
+        let name = unsafe {
+            CStr::from_ptr(property_getName(self))
+        };
+        name.to_str().unwrap()
+    }
+}
+
+impl fmt::Debug for Property {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
 impl Object {
     /// Returns the class of self.
     pub fn class(&self) -> &Class {
@@ -528,7 +635,7 @@ impl fmt::Debug for Object {
 mod tests {
     use crate::test_utils;
     use crate::Encode;
-    use super::{Class, Protocol, Sel};
+    use super::{Class, Protocol, PropertyAttribute, Sel};
 
     #[test]
     fn test_ivar() {
@@ -615,6 +722,26 @@ mod tests {
 
         let protocols = Protocol::protocols();
         assert!(protocols.len() > 0);
+    }
+
+    #[test]
+    fn test_properties() {
+        let hash = class!(NSObject)
+            .properties()
+            .into_iter()
+            .find(|a| a.name() == "hash")
+            .unwrap()
+            .clone();
+
+        let attribute = hash
+            .attributes()
+            .find(|a| match a {
+                PropertyAttribute::TypeEncoding(..) => true,
+                _ => false,
+            })
+            .unwrap();
+
+        assert_eq!(attribute.value(), Some("Q".into()));
     }
 
     #[test]
